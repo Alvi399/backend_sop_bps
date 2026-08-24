@@ -102,4 +102,14 @@ async function startServer() {
   }
 }
 
-startServer();
+// In Vercel serverless environment, export app without blocking listen
+if (process.env.VERCEL === '1') {
+  // Lazy DB authenticate on serverless invocations
+  sequelize.authenticate()
+    .then(() => console.log('✅ MySQL connected on Vercel Serverless'))
+    .catch((err) => console.warn('⚠️ MySQL connection warning on Vercel Serverless:', err.message));
+} else if (require.main === module) {
+  startServer();
+}
+
+module.exports = app;
