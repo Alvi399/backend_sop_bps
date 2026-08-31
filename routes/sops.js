@@ -1,3 +1,27 @@
+// ============================================================
+// FILE: backend/routes/sops.js
+// DESKRIPSI: Route utama untuk CRUD SOP dan alur approval
+//
+// BUG FIX LOG:
+// [BUG 4 - FIXED 2026-08-31] PUT /:id selalu reset approval_status = 'pending'
+//   Gejala: Admin edit SOP yang sudah 'approved' → SOP menjadi pending/tidak aktif lagi
+//   Fix: Hanya reset ke 'pending' jika yang mengedit bukan admin/kepala_bagian
+//
+// [BUG 7 - FIXED 2026-08-31] Versi SOP tidak sinkron saat admin edit
+//   Gejala: SOPRevision mencatat version+1 tapi SOPDocument.version tidak di-update
+//   Fix: Jika admin/kepala edit SOP approved, increment version di SOPDocument juga
+//
+// ALUR BISNIS SOP:
+//   1. Staf/Ketua Tim buat SOP → status: draft, approval_status: pending
+//      Admin/Kepala buat SOP   → status: aktif, approval_status: approved (auto)
+//   2. Admin/Kepala/Ketua Tim: GET /sops untuk lihat semua
+//   3. Approve → PUT /:id/approve → status: aktif, approval_status: approved
+//   4. Reject  → PUT /:id/reject  → status: draft, approval_status: rejected
+//   5. Staf revisi ulang → PUT /:id (edit) → PUT /:id/request-revision → approval_status: pending
+//   6. Approve ulang kembali ke langkah 3
+//
+// PENTING: Urutan route matter! /search/:query harus SEBELUM /:id
+// ============================================================
 const express = require('express');
 const { Op } = require('sequelize');
 const { v4: uuidv4 } = require('uuid');
@@ -201,12 +225,15 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // PUT /api/sops/:id — update SOP
+// [BUG 4 FIX] [BUG 7 FIX] - Lihat komentar di header file
 router.put('/:id', requireAuth, async (req, res) => {
   try {
     const sop = await SOPDocument.findByPk(req.params.id);
     if (!sop) return res.status(404).json({ detail: 'SOP tidak ditemukan' });
 
-    // Pengecekan hak edit: Admin & Kepala Bagian bebas edit; Staf / Ketua Tim hanya SOP milik sendiri atau departemennya
+    // [BISNIS LOGIC] Hak edit:
+    //   - Admin & Kepala Bagian: bebas edit SOP manapun
+    //   - Staf & Ketua Tim: hanya SOP yang dibuat sendiri
     const isOwner = !sop.created_by || sop.created_by === req.user.id;
     const isHigherRole = ['admin', 'kepala_bagian'].includes(req.user.role);
     if (!isHigherRole && !isOwner) {
@@ -218,7 +245,9 @@ router.put('/:id', requireAuth, async (req, res) => {
       description: sop.description,
       department: sop.department,
       responsible_person: sop.responsible_person,
-      status: sop.status
+      status: sop.status,
+      approval_status: sop.approval_status,
+      version: sop.version,
     };
 
     const allowedFields = [
@@ -251,8 +280,37 @@ router.put('/:id', requireAuth, async (req, res) => {
       try { updates.pelaksana_columns = JSON.parse(updates.pelaksana_columns); } catch {}
     }
 
-    // Ubah status approval ke pending jika ada perbaikan data utama
-    updates.approval_status = 'pending';
+    // [BUG 4 FIX] Logika approval_status setelah edit:
+    //   - Sebelumnya: SELALU di-reset ke 'pending' (salah! merusak SOP yang sudah aktif)
+    //   - Sesudah fix:
+    //       * Admin/Kepala edit SOP 'approved' → tetap 'approved', versi di-increment (BUG 7 FIX)
+    //       * Staf/Ketua Tim edit SOP apapun → kembali ke 'pending' (butuh re-approval)
+    //       * Siapapun edit SOP 'rejected'   → kembali ke 'pending' (untuk revisi ulang)
+    let newApprovalStatus;
+    let newVersion = sop.version;
+    let revisionStatus;
+    let revisionDesc;
+
+    if (isHigherRole && sop.approval_status === 'approved') {
+      // [BUG 4 FIX] Admin edit SOP aktif → tetap aktif, versi naik (BUG 7 FIX)
+      newApprovalStatus = 'approved';
+      newVersion = sop.version + 1;
+      updates.status = 'aktif';
+      updates.approved_by = req.user.id;
+      revisionStatus = 'disetujui';
+      revisionDesc = `SOP diperbarui oleh ${req.user.role} dan langsung diaktifkan (v${newVersion})`;
+    } else {
+      // Staf/Ketua edit, atau edit SOP yang belum approved → kembali ke pending
+      newApprovalStatus = 'pending';
+      updates.status = 'draft';
+      revisionStatus = 'menunggu_persetujuan';
+      revisionDesc = sop.approval_status === 'rejected'
+        ? 'SOP telah direvisi setelah penolakan — menunggu persetujuan ulang'
+        : 'SOP diperbarui dan menunggu persetujuan';
+    }
+
+    updates.approval_status = newApprovalStatus;
+    updates.version = newVersion;  // [BUG 7 FIX] Sinkronkan versi di SOPDocument
     updates.updated_by = req.user.id;
 
     await sop.update(updates);
@@ -262,24 +320,31 @@ router.put('/:id', requireAuth, async (req, res) => {
       description: sop.description,
       department: sop.department,
       responsible_person: sop.responsible_person,
-      status: sop.status
+      status: sop.status,
+      approval_status: newApprovalStatus,
+      version: newVersion,
     };
 
+    // Catat revisi dengan informasi yang lebih lengkap
     await SOPRevision.create({
       id: uuidv4(),
       sop_id: sop.id,
-      title: `Update: ${sop.title}`,
-      version: sop.version + 1,
-      changes_description: 'SOP diperbarui dan menunggu persetujuan',
+      title: `Revisi: ${sop.title} (v${newVersion})`,
+      version: newVersion,
+      changes_description: revisionDesc,
       revision_type: 'update',
-      status: 'menunggu_persetujuan',
+      status: revisionStatus,
       revised_by: req.user.id,
+      reviewed_by: isHigherRole && sop.approval_status === 'approved' ? req.user.id : null,
+      approval_date: isHigherRole && sop.approval_status === 'approved' ? new Date() : null,
       revision_date: new Date(),
       old_data: oldData,
       new_data: newData,
     });
 
-    await logActivity(req.user.id, sop.id, 'UPDATE', `Updated SOP: ${sop.title} (Pending Approval)`);
+    const actionLabel = newApprovalStatus === 'approved' ? 'UPDATE_APPROVED' : 'UPDATE';
+    await logActivity(req.user.id, sop.id, actionLabel, `Updated SOP: ${sop.title} → ${newApprovalStatus}`);
+    console.log(`✅ SOP updated: ${sop.code} [${newApprovalStatus}] v${newVersion}`);
     return res.json(sop);
   } catch (err) {
     console.error('❌ Update SOP error:', err);
